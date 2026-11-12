@@ -1,6 +1,8 @@
 """Bốn provider cùng một interface. Không chứa agent loop."""
 import json
 import os
+import threading
+import time
 import urllib.error
 import urllib.request
 
@@ -11,17 +13,61 @@ CONFIG = {
     'anthropic': ('ANTHROPIC_API_KEY', 'https://api.anthropic.com/v1/messages'),
 }
 
+# Shared by agent and judge instances; optional pacing for small API quotas.
+_request_lock = threading.Lock()
+_last_request_at = 0.0
+
+
+def _pace_requests():
+    global _last_request_at
+    interval = float(os.getenv('API_MIN_INTERVAL_SECONDS', '0'))
+    if not 0 <= interval <= 60:
+        raise ValueError('API_MIN_INTERVAL_SECONDS phải nằm trong 0..60.')
+    with _request_lock:
+        wait = interval - (time.monotonic() - _last_request_at)
+        if wait > 0:
+            time.sleep(wait)
+        _last_request_at = time.monotonic()
+
+
+def _retry_delay(exc):
+    """Read safe retry metadata; never print an HTTP response body."""
+    delay = exc.headers.get('Retry-After') if exc.headers else None
+    if delay is None:
+        try:
+            data = json.load(exc)
+            if isinstance(data, list):
+                data = data[0] if data else {}
+            for detail in data.get('error', {}).get('details', []):
+                if 'retryDelay' in detail:
+                    delay = str(detail['retryDelay']).removesuffix('s')
+                    break
+        except (ValueError, AttributeError, TypeError, OSError):
+            pass
+    try:
+        delay = float(delay)
+    except (TypeError, ValueError):
+        delay = 30.0
+    # Do not retry earlier than a long provider cooldown; let the run fail safely.
+    return delay if 0 <= delay <= 60 else None
+
 
 def post_json(url, headers, payload):
     req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json', **headers})
-    try:
-        with urllib.request.urlopen(req, timeout=60) as response:
-            return json.load(response)
-    except urllib.error.HTTPError as exc:
-        # Do not print response bodies: they may contain account or request data.
-        raise RuntimeError(f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.') from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f'Không kết nối được provider: {exc.reason}') from exc
+    for attempt in range(3):
+        _pace_requests()
+        try:
+            with urllib.request.urlopen(req, timeout=60) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as exc:
+            # Retry only rate limits, at most twice. Auth/model errors fail fast.
+            delay = _retry_delay(exc) if exc.code == 429 and attempt < 2 else None
+            if delay is not None:
+                time.sleep(max(1.0, delay))
+                continue
+            raise RuntimeError(f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.') from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f'Không kết nối được provider: {exc.reason}') from exc
 
 
 class Provider:
@@ -38,6 +84,12 @@ class Provider:
         self.name, self.model = name, model
         key_name, self.url = CONFIG[name]
         self.key = os.getenv(key_name)
+        # Custom OpenAI-compatible gateways use the same request/response format.
+        if name == 'openai':
+            self.key = self.key or os.getenv('API_KEY')
+            endpoint = os.getenv('API_ENDPOINT', '').strip().rstrip('/')
+            if endpoint:
+                self.url = endpoint if endpoint.endswith('/chat/completions') else endpoint + '/chat/completions'
         if not self.key:
             raise ValueError(f'Thiếu {key_name}; xem README.md.')
 
@@ -45,12 +97,34 @@ class Provider:
         if self.name == 'anthropic':
             return self._anthropic(messages, schemas)
         payload = {'model': self.model, 'messages': messages}
+        if self.name == 'openrouter':
+            allowed = [p.strip() for p in os.getenv('OPENROUTER_PROVIDER_ONLY', '').split(',') if p.strip()]
+            sort = os.getenv('OPENROUTER_PROVIDER_SORT', '').strip()
+            if sort and sort not in ('price', 'throughput', 'latency'):
+                raise ValueError('OPENROUTER_PROVIDER_SORT cần là price, throughput hoặc latency.')
+            if allowed or sort:
+                payload['provider'] = {'sort': sort or 'price', 'require_parameters': True}
+                if allowed:
+                    payload['provider']['only'] = allowed
         if schemas:
             payload['tools'] = schemas
         data = post_json(self.url, {'Authorization': f'Bearer {self.key}'}, payload)
-        choice = data['choices'][0]
+        if not isinstance(data, dict):
+            raise RuntimeError('Provider trả JSON không đúng định dạng object.')
+        if data.get('error'):
+            error = data['error']
+            code = error.get('code', 'unknown') if isinstance(error, dict) else 'unknown'
+            raise RuntimeError(f'Provider trả lỗi trong JSON, code={code}; thử lại hoặc kiểm tra trạng thái provider.')
+        choices = data.get('choices')
+        if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+            raise RuntimeError('Provider trả phản hồi thiếu choices hợp lệ.')
+        choice = choices[0]
         message = choice['message']
-        calls = [{'id': c['id'], 'name': c['function']['name'], 'arguments': c['function']['arguments']} for c in message.get('tool_calls', [])]
+        calls = [{'id': c['id'], 'name': c['function']['name'], 'arguments': c['function']['arguments']} for c in (message.get('tool_calls') or [])]
+        if choice.get('finish_reason') == 'stop' and not calls:
+            content = message.get('content')
+            if not isinstance(content, str) or not content.strip():
+                raise RuntimeError('Provider trả finish=stop nhưng content rỗng; chưa có câu trả lời cuối. Hãy thử lại hoặc kiểm tra model.')
         return {'message': message, 'calls': calls, 'finish': choice.get('finish_reason'), 'usage': data.get('usage', {})}
 
     def _anthropic(self, messages, schemas):

@@ -11,6 +11,7 @@ from providers import Provider
 from scenarios import ScenarioTools
 from grading import grade_case, summarize, bonus_points
 from bonus.tools import BonusTools
+from env_config import load_env
 
 
 def run_case(case, args):
@@ -35,7 +36,7 @@ def main():
     parser = argparse.ArgumentParser(description='Chạy agent và chấm eval 0–100')
     choices = ['openai', 'gemini', 'anthropic', 'openrouter']
     parser.add_argument('--provider', choices=choices, default=os.getenv('PROVIDER', 'openai'))
-    parser.add_argument('--model', default=os.getenv('MODEL'))
+    parser.add_argument('--model', default=os.getenv('MODEL') or os.getenv('API_MODEL'))
     parser.add_argument('--judge-provider', choices=choices, default=os.getenv('JUDGE_PROVIDER'))
     parser.add_argument('--judge-model', default=os.getenv('JUDGE_MODEL'))
     parser.add_argument('--bonus', action='store_true', help='Chạy bộ bonus riêng; không ảnh hưởng điểm chính')
@@ -60,6 +61,8 @@ def main():
         print(f"Đang chạy {case['id']}", flush=True)
         item = run_case(case, args)
         print(f"{case['id']}: {item['grade'].get('score')} ({item['grade']['status']})", flush=True)
+        if item['grade']['status'] == 'unscored':
+            print(item['result'].get('error') or item['grade']['reason'], flush=True)
         return item
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         results = list(pool.map(run_and_print, selected))
@@ -79,4 +82,5 @@ def main():
     return 0
 
 if __name__ == '__main__':
+    load_env()
     sys.exit(main())
